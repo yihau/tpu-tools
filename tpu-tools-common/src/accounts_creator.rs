@@ -20,7 +20,6 @@ use {
         client_error::Error as ClientError,
         response::transaction::{Transaction, versioned::VersionedTransaction},
     },
-    solana_sdk_ids::system_program,
     solana_signer::Signer,
     solana_system_interface::instruction as system_instruction,
     std::{path::PathBuf, sync::Arc},
@@ -33,8 +32,8 @@ use {
 
 /// How many transactions send concurrently.
 const MAX_RPC_SEND_TX_BATCH: usize = 64;
-/// Max `create_account` instructions packed into one transaction (packet size limit).
-const MAX_CREATE_ACC_IX_PER_TX: usize = 6;
+/// Maximum number of accounts that can be funded in one legacy transaction.
+const MAX_CREATE_ACC_IX_PER_TX: usize = 21;
 /// Used to sleep between accounts creation to avoid getting 429s from RPC.
 const ACCOUNT_CREATION_SLEEP_INTERVAL: Duration = Duration::from_millis(150);
 /// Max number of unsuccessful create accounts attempts.
@@ -61,7 +60,7 @@ pub enum Error {
 ///
 /// The creator checks that the authority has enough lamports to fund the
 /// requested accounts, requests an airdrop when needed, then sends batched
-/// `create_account` transactions.
+/// transfer transactions to fresh payer addresses.
 pub struct AccountsCreator {
     rpc_client: Arc<RpcClient>,
     authority: Keypair,
@@ -120,7 +119,7 @@ impl AccountsCreator {
 
         // Compute the minimum budget for payers
         let min_balance_to_create_account =
-            self.request_create_account_tx_fee(0).await? + self.payer_account_balance_lamports;
+            self.request_funding_tx_fee().await? + self.payer_account_balance_lamports;
         let required_balance = self.num_payers as u64 * min_balance_to_create_account;
         let actual_balance = rpc_client.get_balance(&authority_pubkey).await?;
         info!("Authority balance {actual_balance}, min required balance {required_balance}");
@@ -151,20 +150,13 @@ impl AccountsCreator {
         Ok(())
     }
 
-    /// Computes the fee to create account of given size.
-    async fn request_create_account_tx_fee(&self, size: u64) -> Result<u64, Error> {
-        // Create dummy create account transaction message to calculate fee
-        let rent = self
-            .rpc_client
-            .get_minimum_balance_for_rent_exemption(size as usize)
-            .await?;
-        let payer_pubkey = Pubkey::new_unique();
-        let instructions = vec![system_instruction::create_account(
+    /// Estimate a funding transaction fee using the same single-signer shape.
+    async fn request_funding_tx_fee(&self) -> Result<u64, Error> {
+        let payer_pubkey = self.authority.pubkey();
+        let instructions = vec![system_instruction::transfer(
             &payer_pubkey,
             &Pubkey::new_unique(),
-            rent,
-            size,
-            &system_program::id(),
+            self.payer_account_balance_lamports,
         )];
 
         let blockhash = self.rpc_client.get_latest_blockhash().await?;
@@ -217,35 +209,31 @@ fn create_transaction_batch(
         .map(|ix_batch_size| {
             let (txn, new_accounts): (VersionedTransaction, Vec<Keypair>) = {
                 let mut ixs = Vec::new();
-                let mut signers = Vec::new();
+                let mut new_payers = Vec::new();
                 let authority = authorities_iter
                     .next()
                     .expect("Authorities slice should not be empty because it is cyclical.");
                 for _ in 0..*ix_batch_size {
                     let new_account = Keypair::new();
-                    let instruction = system_instruction::create_account(
+                    let instruction = system_instruction::transfer(
                         &authority.pubkey(),
                         &new_account.pubkey(),
                         balance_lamports,
-                        0,
-                        &system_program::id(),
                     );
 
                     ixs.push(instruction);
-                    signers.push(new_account);
+                    new_payers.push(new_account);
                 }
 
-                let all_signers: Vec<&Keypair> =
-                    std::iter::once(authority).chain(signers.iter()).collect();
                 (
                     Transaction::new_signed_with_payer(
                         &ixs,
                         Some(&authority.pubkey()),
-                        &all_signers,
+                        &[authority],
                         blockhash,
                     )
                     .into(),
-                    signers,
+                    new_payers,
                 )
             };
 
